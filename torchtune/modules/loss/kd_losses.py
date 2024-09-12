@@ -115,3 +115,85 @@ class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
             total_fkl_loss += self.fkl_loss(student_chunk, teacher_chunk, label_chunk)
 
         return total_fkl_loss / self.num_output_chunks
+
+
+class ReverseKLWithChunkedOutputLoss(torch.nn.Module):
+    """
+    Reverse KL with chunked outputs that saves memory by only upcasting one chunk at a time.
+
+    Since the model is trained with bf16, before computing KL divergence, we have to upcast
+    it to fp32 for better accuracy and stability. When upcasting happens, the memory usage doubles.
+    Models like llama3 have large vocabulary size and, therefore, have a large output
+    result (bsz, num_tokens, vocab_size). If we chunk on the token level, you can still compute
+    the cross entropy normally, but upcasting only one chunk at a time saves considerable memory.
+    """
+
+    def __init__(self, num_output_chunks: int = 8, ignore_index: int = -100):
+        super().__init__()
+        self.num_output_chunks = num_output_chunks
+        self.ignore_index = ignore_index
+
+    def forward(
+        self,
+        student_logits: List[torch.Tensor],
+        teacher_logits: List[torch.Tensor],
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            student_logits (List[torch.Tensor]): List of chunked logits from student model of length
+                ``self.num_output_chunks``, where each chunk has shape
+                (batch_size, num_tokens / num_output_chunks, vocab_size).
+            teacher_logits (List[torch.Tensor]): List of chunked logits from teacher model of length
+                ``self.num_output_chunks``, where each chunk has shape
+                (batch_size, num_tokens / num_output_chunks, vocab_size).
+            labels (torch.Tensor): Ground truth labels of shape (batch_size, num_tokens).
+
+        Returns:
+            torch.Tensor: KL divergence loss of shape (1,).
+
+        Example:
+            >>> loss_fn = ForwardKLWithChunkedOutputLoss()
+            >>>
+            >>> h = torch.tensor([bsz, num_tokens, dim])
+            >>> output_chunks = [model.output(chunk) for chunk in h.chunk(num_chunks, dim=1)]
+            >>> teacher_chunks = [teacher_model.output(chunk) for chunk in h.chunk(num_chunks, dim=1)]
+            >>> labels = torch.tensor([bsz, num_tokens])
+            >>> loss = loss_fn(output_chunks, teacher_chunks, labels)
+        """
+
+        # reshape logits [(bsz, num_tokens/num_chunks, vocab)] -> [(bsz*num_tokens/num_chunks, vocab)]
+        teacher_logits = [
+            teacher_logits_chunk.reshape(-1, teacher_logits_chunk.size(-1))
+            for teacher_logits_chunk in teacher_logits
+        ]
+        student_logits = [
+            student_logits_chunk.reshape(-1, student_logits_chunk.size(-1))
+            for student_logits_chunk in student_logits
+        ]
+        # chunk and reshape labels (bsz, num_tokens, vocab) -> [(bsz*num_tokens/num_chunks, vocab)]
+        labels = [
+            target_chunk.reshape(-1)
+            for target_chunk in labels.chunk(self.num_output_chunks, dim=1)
+        ]
+        total_rkl_loss = 0.0
+        for student_chunk, teacher_chunk, label_chunk in zip(
+            student_logits, teacher_logits, labels
+        ):
+            student_probs = F.softmax(student_chunk, dim=-1, dtype=torch.float32)
+            student_logprobs = F.log_softmax(student_chunk, dim=-1, dtype=torch.float32)
+            teacher_logprobs = F.log_softmax(teacher_chunk, dim=-1, dtype=torch.float32)
+            inf_mask = torch.isinf(teacher_chunk) | torch.isinf(student_chunk)
+            prod_probs = torch.masked_fill(
+                student_probs * teacher_logprobs, inf_mask, 0
+            )
+            prod_probs -= torch.masked_fill(
+                student_probs * student_logprobs, inf_mask, 0
+            )
+            x = torch.sum(prod_probs, dim=-1).view(-1)
+            mask = (label_chunk != self.ignore_index).int()
+            total_rkl_loss += -torch.sum(x * mask.view(-1), dim=0) / torch.sum(
+                mask.view(-1), dim=0
+            )
+
+        return total_rkl_loss / self.num_output_chunks
